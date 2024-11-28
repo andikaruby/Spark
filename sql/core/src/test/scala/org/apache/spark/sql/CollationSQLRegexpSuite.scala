@@ -112,7 +112,11 @@ class CollationSQLRegexpSuite
     val tableNameLcase = "T_LCASE"
     withTable(tableNameLcase) {
       withSQLConf(SqlApiConf.DEFAULT_COLLATION -> "UTF8_LCASE") {
-        sql(s"CREATE TABLE IF NOT EXISTS $tableNameLcase(c STRING) using PARQUET")
+        sql(s"""
+             |CREATE TABLE IF NOT EXISTS $tableNameLcase(
+             |  c STRING COLLATE UTF8_LCASE
+             |) using PARQUET
+             |""".stripMargin)
         sql(s"INSERT INTO $tableNameLcase(c) VALUES('ABC')")
         checkAnswer(sql(s"select c like 'ab%' FROM $tableNameLcase"), Row(true))
         checkAnswer(sql(s"select c like '%bc' FROM $tableNameLcase"), Row(true))
@@ -448,7 +452,8 @@ class CollationSQLRegexpSuite
         },
         condition = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
         parameters = Map(
-          "sqlExpr" -> "\"regexp_replace(collate(ABCDE, UNICODE_CI), .c., FFF, 1)\"",
+          "sqlExpr" -> ("\"regexp_replace(collate(ABCDE, UNICODE_CI), " +
+            ".c., 'FFF' collate UNICODE_CI, 1)\""),
           "paramIndex" -> "first",
           "inputSql" -> "\"collate(ABCDE, UNICODE_CI)\"",
           "inputType" -> "\"STRING COLLATE UNICODE_CI\"",
