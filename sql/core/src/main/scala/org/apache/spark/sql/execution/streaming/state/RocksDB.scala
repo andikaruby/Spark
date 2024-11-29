@@ -84,7 +84,8 @@ class RocksDB(
       columnFamilyMapping: Map[String, Short],
       maxColumnFamilyId: Short,
       dfsFileSuffix: String,
-      fileMapping: Map[String, RocksDBSnapshotFile]) {
+      fileMapping: Map[String, RocksDBSnapshotFile],
+      uniqueId: Option[String] = None) {
     def close(): Unit = {
       silentDeleteRecursively(checkpointDir, s"Free up local checkpoint of snapshot $version")
     }
@@ -158,7 +159,7 @@ class RocksDB(
   @volatile private var db: NativeRocksDB = _
   @volatile private var changelogWriter: Option[StateStoreChangelogWriter] = None
   private val enableChangelogCheckpointing: Boolean = conf.enableChangelogCheckpointing
-  @volatile private var loadedVersion = -1L   // -1 = nothing valid is loaded
+  @volatile protected var loadedVersion: Long = -1L   // -1 = nothing valid is loaded
 
   // variables to manage checkpoint ID. Once a checkpointing finishes, it needs to return
   // `lastCommittedStateStoreCkptId` as the committed checkpointID, as well as
@@ -170,10 +171,11 @@ class RocksDB(
   // we have to use a new one. We have to update `sessionStateStoreCkptId` if we reload a previous
   // batch version, as we would have to use a new checkpointID for re-committing a version.
   // The reusing is to help debugging but is not required for the algorithm to work.
-  private var lastCommitBasedStateStoreCkptId: Option[String] = None
-  private var lastCommittedStateStoreCkptId: Option[String] = None
-  private var loadedStateStoreCkptId: Option[String] = None
-  private var sessionStateStoreCkptId: Option[String] = None
+  protected var lastCommitBasedStateStoreCkptId: Option[String] = None
+  protected var lastCommittedStateStoreCkptId: Option[String] = None
+  protected var loadedStateStoreCkptId: Option[String] = None
+  protected var sessionStateStoreCkptId: Option[String] = None
+  protected[sql] val lineageManager: RocksDBLineageManager = new RocksDBLineageManager
 
   @volatile private var numKeysOnLoadedVersion = 0L
   @volatile private var numKeysOnWritingVersion = 0L
@@ -279,65 +281,177 @@ class RocksDB(
   private val snapshotsToUploadQueue = new ConcurrentLinkedQueue[RocksDBSnapshot]()
 
   /**
+   * Based on the ground truth lineage loaded from changelog file (lineage) and
+   * the latest snapshot (version, uniqueId) pair from file listing, this function finds
+   * the ground truth latest snapshot (version, uniqueId) the db instance needs to load.
+   *
+   * @param lineage the ground truth lineage loaded from changelog file
+   * @param latestSnapshotVersionsAndUniqueIds
+   *   (version, uniqueId) pair of the latest snapshot version. In case of task re-execution,
+   *   the array could have more than one element.
+   * @return the ground truth latest snapshot (version, uniqueId) the db instance needs to load
+   */
+  private def getLatestSnapshotVersionAndUniqueIdFromLineage(
+      lineage: Array[LineageItem],
+      latestSnapshotVersionsAndUniqueIds: Array[(Long, Option[String])]):
+      (Long, Option[String]) = {
+    lineage.foreach {
+      case LineageItem(version, uniqueId) =>
+        if (latestSnapshotVersionsAndUniqueIds.contains((version, Some(uniqueId)))) {
+          return (version, Some(uniqueId))
+        }
+    }
+    throw QueryExecutionErrors.cannotGetLatestSnapshotVersionAndUniqueIdFromLineage(
+      printLineageItems(lineage), printLineage(latestSnapshotVersionsAndUniqueIds)
+    )
+  }
+
+  /**
+   * Read the lineage from the changelog files. It first get the changelog reader
+   * of the correct changelog version and then read the lineage information from the file.
+   * The changelog file is named as version_stateStoreCkptId.changelog
+   * @param version version of the changelog file, used to load changelog file.
+   * @param stateStoreCkptId uniqueId of the changelog file, used to load changelog file.
+   * @return
+   */
+  private def getLineageFromChangelogFile(
+      version: Long,
+      stateStoreCkptId: Option[String]): Array[LineageItem] = {
+    var changelogReader: StateStoreChangelogReader = null
+    var currLineage: Array[LineageItem] = Array.empty
+    try {
+      changelogReader = fileManager.getChangelogReader(version, stateStoreCkptId)
+      currLineage = changelogReader.lineage
+      logInfo(log"Loading lineage: " +
+        log"${MDC(LogKeys.LINEAGE, lineageManager)} from " +
+        log"changelog version: ${MDC(LogKeys.VERSION_NUM, version)} " +
+        log"uniqueId: ${MDC(LogKeys.UUID, stateStoreCkptId.getOrElse(""))}.")
+    } finally {
+      if (changelogReader != null) {
+        changelogReader.closeIfNeeded()
+      }
+    }
+    currLineage
+  }
+
+
+  /**
    * Load the given version of data in a native RocksDB instance.
    * Note that this will copy all the necessary file from DFS to local disk as needed,
    * and possibly restart the native RocksDB instance.
    */
-  def load(
+  private def loadV2(
+        version: Long,
+        stateStoreCkptId: Option[String],
+        readOnly: Boolean = false): RocksDB = {
+  // An array contains lineage information from [snapShotVersion, version] (inclusive both end)
+  var currVersionLineage: Array[LineageItem] = lineageManager.getLineage()
+  try {
+    if (loadedVersion != version || (loadedStateStoreCkptId.isEmpty ||
+        stateStoreCkptId.get != loadedStateStoreCkptId.get)) {
+      closeDB(ignoreException = false)
+
+      val (latestSnapshotVersion, latestSnapshotUniqueId) = {
+        // Special handling when version is 0.
+        // When loading the very first version (0), stateStoreCkptId does not need to be defined
+        // because there won't be 0.changelog / 0.zip file created in RocksDB.
+        if (version == 0 && stateStoreCkptId.isEmpty) {
+          (0L, None)
+        // When there is a snapshot file, it is the ground truth, we can skip
+        // reconstructing the lineage from changelog file.
+        } else if (fileManager.existsSnapshotFile(version, stateStoreCkptId)) {
+          currVersionLineage = Array(LineageItem(version, stateStoreCkptId.get))
+          lineageManager.resetLineage(currVersionLineage)
+          (version, stateStoreCkptId)
+        } else {
+          val latestSnapshotVersionsAndUniqueIds =
+            fileManager.getLatestSnapshotVersionAndUniqueId(version, stateStoreCkptId)
+          currVersionLineage = getLineageFromChangelogFile(version, stateStoreCkptId) :+
+            LineageItem(version, stateStoreCkptId.get)
+          lineageManager.resetLineage(currVersionLineage)
+          if (latestSnapshotVersionsAndUniqueIds.length == 0) {
+            (0L, None)
+          } else {
+            logInfo(log"Latest snapshot version and uniqueId found: " +
+              log"${MDC(LogKeys.LINEAGE, printLineage(latestSnapshotVersionsAndUniqueIds))}.")
+            getLatestSnapshotVersionAndUniqueIdFromLineage(
+              currVersionLineage, latestSnapshotVersionsAndUniqueIds)
+          }
+        }
+      }
+
+      logInfo(log"Loaded latestSnapshotVersion: ${
+        MDC(LogKeys.SNAPSHOT_VERSION, latestSnapshotVersion)}, latestSnapshotUniqueId: ${
+        MDC(LogKeys.UUID, latestSnapshotUniqueId)}")
+
+      val metadata = fileManager.loadCheckpointFromDfs(latestSnapshotVersion,
+        workingDir, rocksDBFileMapping, latestSnapshotUniqueId)
+
+      init(version, latestSnapshotVersion, metadata)
+
+      if (loadedVersion != version) {
+        replayChangelog(version, Some(currVersionLineage))
+      }
+      // After changelog replay the numKeysOnWritingVersion will be updated to
+      // the correct number of keys in the loaded version.
+      numKeysOnLoadedVersion = numKeysOnWritingVersion
+      fileManagerMetrics = fileManager.latestLoadCheckpointMetrics
+    }
+
+    lastCommitBasedStateStoreCkptId = None
+    loadedStateStoreCkptId = stateStoreCkptId
+    sessionStateStoreCkptId = Some(java.util.UUID.randomUUID.toString)
+    lastCommittedStateStoreCkptId = None
+
+    if (conf.resetStatsOnLoad) {
+      nativeStats.reset
+    }
+
+    logInfo(log"Loaded ${MDC(LogKeys.VERSION_NUM, version)} " +
+      log"with uniqueId ${MDC(LogKeys.UUID, stateStoreCkptId)}")
+  } catch {
+    case t: Throwable =>
+      loadedVersion = -1  // invalidate loaded data
+      lastCommitBasedStateStoreCkptId = None
+      lastCommittedStateStoreCkptId = None
+      loadedStateStoreCkptId = None
+      sessionStateStoreCkptId = None
+      lineageManager.clear()
+      throw t
+  }
+  if (enableChangelogCheckpointing && !readOnly) {
+    // Make sure we don't leak resource.
+    changelogWriter.foreach(_.abort())
+    // Initialize the changelog writer with lineage info
+    // The lineage stored in changelog files should normally start with
+    // the version of a snapshot, except for the first few versions.
+    // Because they are solely loaded from changelog file.
+    // (e.g. with default minDeltasForSnapshot, there is only 1_uuid1.changelog, no 1_uuid1.zip)
+    // It should end with exactly one version before the change log's version.
+    changelogWriter = Some(fileManager.getChangeLogWriter(
+      version + 1, useColumnFamilies, sessionStateStoreCkptId, Some(currVersionLineage)))
+  }
+  this
+}
+
+  private def loadV1(
       version: Long,
-      stateStoreCkptId: Option[String] = None,
       readOnly: Boolean = false): RocksDB = {
-    assert(version >= 0)
-    acquire(LoadStore)
-    recordedMetrics = None
-    logInfo(log"Loading ${MDC(LogKeys.VERSION_NUM, version)}")
     try {
-      if (loadedVersion != version ||
-        (enableStateStoreCheckpointIds && stateStoreCkptId.isDefined &&
-        (loadedStateStoreCkptId.isEmpty || stateStoreCkptId.get != loadedStateStoreCkptId.get))) {
+      if (loadedVersion != version) {
         closeDB(ignoreException = false)
         val latestSnapshotVersion = fileManager.getLatestSnapshotVersion(version)
         val metadata = fileManager.loadCheckpointFromDfs(latestSnapshotVersion,
           workingDir, rocksDBFileMapping)
-        loadedVersion = latestSnapshotVersion
 
-        // reset the last snapshot version to the latest available snapshot version
-        lastSnapshotVersion = latestSnapshotVersion
+        init(version, latestSnapshotVersion, metadata)
 
-        // Initialize maxVersion upon successful load from DFS
-        fileManager.setMaxSeenVersion(version)
-
-        setInitialCFInfo()
-        metadata.columnFamilyMapping.foreach { mapping =>
-          colFamilyNameToIdMap.putAll(mapping.asJava)
-        }
-
-        metadata.maxColumnFamilyId.foreach { maxId =>
-          maxColumnFamilyId.set(maxId)
-        }
-        openDB()
-        numKeysOnWritingVersion = if (!conf.trackTotalNumberOfRows) {
-            // we don't track the total number of rows - discard the number being track
-            -1L
-          } else if (metadata.numKeys < 0) {
-            // we track the total number of rows, but the snapshot doesn't have tracking number
-            // need to count keys now
-            countKeys()
-          } else {
-            metadata.numKeys
-          }
         if (loadedVersion != version) replayChangelog(version)
         // After changelog replay the numKeysOnWritingVersion will be updated to
         // the correct number of keys in the loaded version.
         numKeysOnLoadedVersion = numKeysOnWritingVersion
         fileManagerMetrics = fileManager.latestLoadCheckpointMetrics
       }
-      if (enableStateStoreCheckpointIds) {
-        lastCommitBasedStateStoreCkptId = None
-        loadedStateStoreCkptId = stateStoreCkptId
-        sessionStateStoreCkptId = Some(java.util.UUID.randomUUID.toString)
-      }
-      lastCommittedStateStoreCkptId = None
       if (conf.resetStatsOnLoad) {
         nativeStats.reset
       }
@@ -345,16 +459,62 @@ class RocksDB(
     } catch {
       case t: Throwable =>
         loadedVersion = -1  // invalidate loaded data
-        lastCommitBasedStateStoreCkptId = None
-        lastCommittedStateStoreCkptId = None
-        loadedStateStoreCkptId = None
-        sessionStateStoreCkptId = None
         throw t
     }
     if (enableChangelogCheckpointing && !readOnly) {
       // Make sure we don't leak resource.
       changelogWriter.foreach(_.abort())
       changelogWriter = Some(fileManager.getChangeLogWriter(version + 1, useColumnFamilies))
+    }
+    this
+  }
+
+  private def init(
+      version: Long,
+      latestSnapshotVersion: Long,
+      metadata: RocksDBCheckpointMetadata): Unit = {
+    loadedVersion = latestSnapshotVersion
+
+    // reset the last snapshot version to the latest available snapshot version
+    lastSnapshotVersion = latestSnapshotVersion
+
+    // Initialize maxVersion upon successful load from DFS
+    fileManager.setMaxSeenVersion(version)
+
+    setInitialCFInfo()
+    metadata.columnFamilyMapping.foreach { mapping =>
+      colFamilyNameToIdMap.putAll(mapping.asJava)
+    }
+
+    metadata.maxColumnFamilyId.foreach { maxId =>
+      maxColumnFamilyId.set(maxId)
+    }
+    openDB()
+    numKeysOnWritingVersion = if (!conf.trackTotalNumberOfRows) {
+      // we don't track the total number of rows - discard the number being track
+      -1L
+    } else if (metadata.numKeys < 0) {
+      // we track the total number of rows, but the snapshot doesn't have tracking number
+      // need to count keys now
+      countKeys()
+    } else {
+      metadata.numKeys
+    }
+  }
+
+  def load(
+      version: Long,
+      stateStoreCkptId: Option[String] = None,
+      readOnly: Boolean = false): RocksDB = {
+    assert(version >= 0)
+    acquire(LoadStore)
+    recordedMetrics = None
+    logInfo(log"Loading ${MDC(LogKeys.VERSION_NUM, version)} with stateStoreCkptId: ${
+      MDC(LogKeys.UUID, stateStoreCkptId.getOrElse(""))}")
+    if (enableStateStoreCheckpointIds) {
+      loadV2(version, stateStoreCkptId, readOnly)
+    } else {
+      loadV1(version, readOnly)
     }
     this
   }
@@ -431,16 +591,27 @@ class RocksDB(
   /**
    * Replay change log from the loaded version to the target version.
    */
-  private def replayChangelog(endVersion: Long): Unit = {
+  private def replayChangelog(
+      endVersion: Long,
+      stateStoreCkptIdLineage: Option[Array[LineageItem]] = None): Unit = {
+
+    val versionsAndUniqueIds = stateStoreCkptIdLineage match {
+      // First entry of lineage corresponds to loadedVersion
+      case Some(lineage) => lineage.map(i => (i.version, Some(i.checkpointUniqueId)))
+      case None => (loadedVersion + 1 to endVersion).map((_, None)).toArray
+    }
+
     logInfo(log"Replaying changelog from version " +
       log"${MDC(LogKeys.LOADED_VERSION, loadedVersion)} -> " +
       log"${MDC(LogKeys.END_VERSION, endVersion)}")
-    for (v <- loadedVersion + 1 to endVersion) {
-      logInfo(log"Replaying changelog on version " +
-        log"${MDC(LogKeys.VERSION_NUM, v)}")
+
+    versionsAndUniqueIds.foreach { case (v, uniqueId) =>
+      logInfo(log"replaying changelog from version ${MDC(LogKeys.VERSION_NUM, v)} with " +
+        log"unique Id: ${MDC(LogKeys.UUID, uniqueId)}")
+
       var changelogReader: StateStoreChangelogReader = null
       try {
-        changelogReader = fileManager.getChangelogReader(v, useColumnFamilies)
+        changelogReader = fileManager.getChangelogReader(v, uniqueId)
         changelogReader.foreach { case (recordType, key, value) =>
           recordType match {
             case RecordType.PUT_RECORD =>
@@ -648,8 +819,9 @@ class RocksDB(
           // inside the uploadSnapshot() called below.
           // If changelog checkpointing is enabled, snapshot will be uploaded asynchronously
           // during state store maintenance.
-          snapshot = Some(createSnapshot(checkpointDir, newVersion,
-            colFamilyNameToIdMap.asScala.toMap, maxColumnFamilyId.get().toShort))
+          snapshot = Some(createSnapshot(
+            checkpointDir, newVersion, colFamilyNameToIdMap.asScala.toMap,
+            maxColumnFamilyId.get().toShort, sessionStateStoreCkptId))
           lastSnapshotVersion = newVersion
         }
       }
@@ -695,6 +867,18 @@ class RocksDB(
         }
       }
 
+      if (enableStateStoreCheckpointIds) {
+        lastCommitBasedStateStoreCkptId = loadedStateStoreCkptId
+        lastCommittedStateStoreCkptId = sessionStateStoreCkptId
+        loadedStateStoreCkptId = sessionStateStoreCkptId
+        lineageManager.appendLineageItem(LineageItem(newVersion, sessionStateStoreCkptId.get))
+        logInfo(log"Update checkpoint IDs and lineage: ${MDC(
+          LogKeys.LOADED_CHECKPOINT_ID, loadedStateStoreCkptId)}," +
+          log" ${MDC(LogKeys.LAST_COMMITTED_CHECKPOINT_ID, lastCommittedStateStoreCkptId)}," +
+          log" ${MDC(LogKeys.LAST_COMMIT_BASED_CHECKPOINT_ID, lastCommitBasedStateStoreCkptId)}," +
+          log" ${MDC(LogKeys.LINEAGE, lineageManager)}")
+      }
+
       // Set maxVersion when checkpoint files are synced to DFS successfully
       // We need to handle this explicitly in RocksDB as we could use different
       // changeLogWriter instances in fileManager instance when committing
@@ -702,11 +886,6 @@ class RocksDB(
 
       numKeysOnLoadedVersion = numKeysOnWritingVersion
       loadedVersion = newVersion
-      if (enableStateStoreCheckpointIds) {
-        lastCommitBasedStateStoreCkptId = loadedStateStoreCkptId
-        lastCommittedStateStoreCkptId = sessionStateStoreCkptId
-        loadedStateStoreCkptId = sessionStateStoreCkptId
-      }
       commitLatencyMs ++= Map(
         "flush" -> flushTimeMs,
         "compact" -> compactTimeMs,
@@ -748,6 +927,7 @@ class RocksDB(
       lastCommittedStateStoreCkptId = None
       loadedStateStoreCkptId = None
       sessionStateStoreCkptId = None
+      lineageManager.clear()
       changelogWriter.foreach(_.abort())
       // Make sure changelogWriter gets recreated next time.
       changelogWriter = None
@@ -917,15 +1097,16 @@ class RocksDB(
   }
 
   private def createSnapshot(
-      checkpointDir: File,
-      version: Long,
-      columnFamilyMapping: Map[String, Short],
-      maxColumnFamilyId: Short): RocksDBSnapshot = {
+    checkpointDir: File,
+    version: Long,
+    columnFamilyMapping: Map[String, Short],
+    maxColumnFamilyId: Short,
+    uniqueId: Option[String] = None): RocksDBSnapshot = {
     val (dfsFileSuffix, immutableFileMapping) = rocksDBFileMapping.createSnapshotFileMapping(
       fileManager, checkpointDir, version)
 
     RocksDBSnapshot(checkpointDir, version, numKeysOnWritingVersion,
-      columnFamilyMapping, maxColumnFamilyId, dfsFileSuffix, immutableFileMapping)
+      columnFamilyMapping, maxColumnFamilyId, dfsFileSuffix, immutableFileMapping, uniqueId)
   }
 
   /**
@@ -1036,6 +1217,40 @@ class RocksDB(
     Option(acquiredThreadInfo).map(_.copy())
   }
 
+  /** Upload the snapshot to DFS and remove it from snapshots pending */
+  private def uploadSnapshot(
+    snapshot: RocksDB#RocksDBSnapshot,
+    fileManager: RocksDBFileManager,
+    snapshotsPendingUpload: Set[RocksDBVersionSnapshotInfo],
+    loggingId: String): RocksDBFileManagerMetrics = {
+    var fileManagerMetrics: RocksDBFileManagerMetrics = null
+    try {
+      val uploadTime = timeTakenMs {
+        fileManager.saveCheckpointToDfs(snapshot.checkpointDir,
+          snapshot.version, snapshot.numKeys, snapshot.fileMapping,
+          Some(snapshot.columnFamilyMapping), Some(snapshot.maxColumnFamilyId), snapshot.uniqueId)
+        fileManagerMetrics = fileManager.latestSaveCheckpointMetrics
+
+        val snapshotInfo = RocksDBVersionSnapshotInfo(snapshot.version, snapshot.dfsFileSuffix)
+        // We are only removing the uploaded snapshot info from the pending set,
+        // to let the file mapping (i.e. query threads) know that the snapshot (i.e. and its files)
+        // have been uploaded to DFS. We don't touch the file mapping here to avoid corrupting it.
+        snapshotsPendingUpload.remove(snapshotInfo)
+      }
+      lineageManager.resetLineage(lineageManager.getLineage()
+        .filter(i => i.version >= snapshot.version))
+      logInfo(log"${MDC(LogKeys.LOG_ID, loggingId)}: " +
+        log"Upload snapshot of version ${MDC(LogKeys.VERSION_NUM, snapshot.version)}, " +
+        log"with uniqueId: ${MDC(LogKeys.UUID, snapshot.uniqueId)} " +
+        log"time taken: ${MDC(LogKeys.TIME_UNITS, uploadTime)} ms. " +
+        log"Current lineage: ${MDC(LogKeys.LINEAGE, lineageManager)}")
+    } finally {
+      snapshot.close()
+    }
+
+    fileManagerMetrics
+  }
+
   /** Create a native RocksDB logger that forwards native logs to log4j with correct log levels. */
   private def createLogger(): Logger = {
     val dbLogger = new Logger(rocksDbOptions.infoLogLevel()) {
@@ -1088,35 +1303,14 @@ class RocksDB(
 
 object RocksDB extends Logging {
 
-  /** Upload the snapshot to DFS and remove it from snapshots pending */
-  private def uploadSnapshot(
-      snapshot: RocksDB#RocksDBSnapshot,
-      fileManager: RocksDBFileManager,
-      snapshotsPendingUpload: Set[RocksDBVersionSnapshotInfo],
-      loggingId: String): RocksDBFileManagerMetrics = {
-    var fileManagerMetrics: RocksDBFileManagerMetrics = null
-    try {
-      val uploadTime = timeTakenMs {
-        fileManager.saveCheckpointToDfs(snapshot.checkpointDir,
-          snapshot.version, snapshot.numKeys, snapshot.fileMapping,
-          Some(snapshot.columnFamilyMapping), Some(snapshot.maxColumnFamilyId))
-        fileManagerMetrics = fileManager.latestSaveCheckpointMetrics
+  private def printLineage(lineage: Array[(Long, Option[String])]): String = lineage.map {
+    case (l, optStr) => s"$l:${optStr.getOrElse("")}"
+  }.mkString(" ")
 
-        val snapshotInfo = RocksDBVersionSnapshotInfo(snapshot.version, snapshot.dfsFileSuffix)
-        // We are only removing the uploaded snapshot info from the pending set,
-        // to let the file mapping (i.e. query threads) know that the snapshot (i.e. and its files)
-        // have been uploaded to DFS. We don't touch the file mapping here to avoid corrupting it.
-        snapshotsPendingUpload.remove(snapshotInfo)
-      }
-      logInfo(log"${MDC(LogKeys.LOG_ID, loggingId)}: Upload snapshot of version " +
-        log"${MDC(LogKeys.VERSION_NUM, snapshot.version)}," +
-        log" time taken: ${MDC(LogKeys.TIME_UNITS, uploadTime)} ms")
-    } finally {
-      snapshot.close()
-    }
+  private def printLineageItems(lineage: Array[LineageItem]): String = lineage.map {
+    case LineageItem(l, optStr) => s"$l:$optStr"
+  }.mkString(" ")
 
-    fileManagerMetrics
-  }
 
   /** Records the duration of running `body` for the next query progress update. */
   private def timeTakenMs(body: => Unit): Long = Utils.timeTakenMs(body)._2
@@ -1533,3 +1727,40 @@ case class AcquiredThreadInfo(
   }
 }
 
+/**
+ * A helper class to manage the lineage information when checkpoint unique id is enabled.
+ * "lineage" is an array of LineageItem (version, uniqueId) pair.
+ *
+ * The first item of "lineage" should normally be the version of a snapshot, except
+ * for the first few versions. Because they are solely loaded from changelog file.
+ * (i.e. with default minDeltasForSnapshot, there is only 1_uuid1.changelog, no 1_uuid1.zip)
+ *
+ * The last item of "lineage" corresponds to one version before the to-be-committed version.
+ */
+private[sql] class RocksDBLineageManager {
+  @volatile private var lineage: Array[LineageItem] = Array.empty
+
+  override def toString: String = lineage.map {
+    case LineageItem(version, uuid) => s"$version: $uuid"
+  }.mkString(" ")
+
+  def appendLineageItem(item: LineageItem): Unit = {
+    lineage = lineage :+ item
+  }
+
+  def resetLineage(newLineage: Array[LineageItem]): Unit = {
+    lineage = newLineage
+  }
+
+  def getLineage(): Array[LineageItem] = {
+    lineage.clone()
+  }
+
+  def contains(item: LineageItem): Boolean = {
+    lineage.contains(item)
+  }
+
+  def clear(): Unit = {
+    lineage = Array.empty
+  }
+}
