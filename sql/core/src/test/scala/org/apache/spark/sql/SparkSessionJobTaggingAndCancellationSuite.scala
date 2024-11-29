@@ -330,4 +330,109 @@ class SparkSessionJobTaggingAndCancellationSuite
       threadPool.shutdownNow()
     }
   }
+
+  test("Interrupt jobs by tag") {
+    val session = SparkSession.builder()
+      .master("local[2]")
+      .appName("test-interrupt-tag")
+      .getOrCreate()
+
+    import session.implicits._
+
+    // Custom thread pool for job execution
+    val threadPool = Executors.newFixedThreadPool(4)
+    implicit val ec: ExecutionContext = ExecutionContext.fromExecutor(threadPool)
+
+    try {
+      // Helper function to run a job with a tag
+      def runJobWithTag(tag: String): Future[Long] = Future {
+        session.addTag(tag)
+        session.range(1, 100000)
+          .map(i => {
+            Thread.sleep(10); i
+          })
+          .count()
+      }
+
+      // Run jobs with different tags
+      val futureA = runJobWithTag("tag_A")
+      val futureB = runJobWithTag("tag_B")
+
+      // Wait briefly to ensure jobs are running
+      Thread.sleep(1000)
+
+      // Interrupt jobs with "tag_A"
+      val interruptedIds = session.interruptTag("tag_A")
+
+      // Validate the interruption
+      assert(interruptedIds.nonEmpty, "No jobs were interrupted for tag_A")
+
+      // Ensure the interrupted job fails
+      val resultA = intercept[Exception] {
+        ThreadUtils.awaitResult(futureA, 10.seconds)
+      }
+      assert(resultA.getMessage.contains("cancelled"), "Expected job_A to be cancelled")
+
+      // Ensure the non-interrupted job succeeds
+      val resultB = ThreadUtils.awaitResult(futureB, 10.seconds)
+      assert(resultB == 99999L, "Job B did not complete successfully")
+
+    } finally {
+      threadPool.shutdownNow()
+      session.stop()
+    }
+  }
+
+  test("Interrupt all jobs") {
+    val session = SparkSession.builder()
+      .master("local[2]")
+      .appName("test-interrupt-all")
+      .getOrCreate()
+
+    import session.implicits._
+
+    // Custom thread pool for job execution
+    val threadPool = Executors.newFixedThreadPool(4)
+    implicit val ec: ExecutionContext = ExecutionContext.fromExecutor(threadPool)
+
+    try {
+      // Helper function to run a long-running job
+      def runJob(): Future[Long] = Future {
+        session.range(1, 100000)
+          .map(i => {
+            Thread.sleep(10); i
+          })
+          .count()
+      }
+
+      // Run multiple long-running jobs
+      val futureA = runJob()
+      val futureB = runJob()
+      val futureC = runJob()
+
+      // Wait briefly to ensure jobs are running
+      Thread.sleep(1000)
+
+      // Interrupt all jobs
+      val interruptedIds = session.interruptAll()
+
+      // Validate the interruption
+      assert(interruptedIds.nonEmpty, "No jobs were interrupted")
+
+      // Ensure all interrupted jobs fail
+      val results = Seq(futureA, futureB, futureC).map { future =>
+        intercept[Exception] {
+          ThreadUtils.awaitResult(future, 10.seconds)
+        }
+      }
+
+      results.foreach { e =>
+        assert(e.getMessage.contains("cancelled"), "Expected jobs to be cancelled")
+      }
+
+    } finally {
+      threadPool.shutdownNow()
+      session.stop()
+    }
+  }
 }

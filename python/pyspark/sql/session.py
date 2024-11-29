@@ -2205,7 +2205,6 @@ class SparkSession(SparkConversionMixin):
             messageParameters={"feature": "SparkSession.copyFromLocalToFs"},
         )
 
-    @remote_only
     def interruptAll(self) -> List[str]:
         """
         Interrupt all operations of this session currently running on the connected server.
@@ -2221,12 +2220,16 @@ class SparkSession(SparkConversionMixin):
         -----
         There is still a possibility of operation finishing just as it is interrupted.
         """
-        raise PySparkRuntimeError(
-            errorClass="ONLY_SUPPORTED_WITH_SPARK_CONNECT",
-            messageParameters={"feature": "SparkSession.interruptAll"},
-        )
+        java_list = self._jsparkSession.interruptAll()
+        python_list = list()
 
-    @remote_only
+        # Use iterator to manually iterate through Java list
+        java_iterator = java_list.iterator()
+        while java_iterator.hasNext():
+            python_list.append(str(java_iterator.next()))
+
+        return python_list
+
     def interruptTag(self, tag: str) -> List[str]:
         """
         Interrupt all operations of this session with the given operation tag.
@@ -2242,10 +2245,15 @@ class SparkSession(SparkConversionMixin):
         -----
         There is still a possibility of operation finishing just as it is interrupted.
         """
-        raise PySparkRuntimeError(
-            errorClass="ONLY_SUPPORTED_WITH_SPARK_CONNECT",
-            messageParameters={"feature": "SparkSession.interruptTag"},
-        )
+        java_list = self._jsparkSession.interruptTag(tag)
+        python_list = list()
+
+        # Use iterator to manually iterate through Java list
+        java_iterator = java_list.iterator()
+        while java_iterator.hasNext():
+            python_list.append(str(java_iterator.next()))
+
+        return python_list
 
     @remote_only
     def interruptOperation(self, op_id: str) -> List[str]:
