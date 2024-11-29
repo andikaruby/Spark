@@ -6476,6 +6476,55 @@ class DataFrame:
         """
         ...
 
+    def argument(
+        self,
+        partitionBy: Optional[List["ColumnOrName"]] = None,
+        orderBy: Optional[List["ColumnOrName"]] = None,
+        withSinglePartition: bool = False,
+    ) -> Column:
+        """
+        Converts the DataFrame into a `Column` object for use with table-valued functions (TVFs)
+        or user-defined table functions (UDTFs).
+
+        .. versionadded:: 4.0.0
+
+        Parameters
+        ----------
+        partitionBy : list of str or :class:`Column`, optional
+            A list of `Column` objects specifying how to partition the data. Rows with the same values
+            in the specified columns are grouped into the same partition. If None, no partitioning is applied.
+        orderBy : list of str or :class:`Column`, optional
+            A list of `Column` objects specifying how to order rows within each partition.
+            If None, no specific ordering is applied.
+        withSinglePartition : bool, optional
+            If True, forces the entire data into a single partition. Defaults to False.
+
+        Returns
+        -------
+        :class:`Column`
+            A `Column` object representing the DataFrame.
+
+        Examples
+        --------
+        >>> from pyspark.sql import Row
+        >>> from pyspark.sql.functions import udtf
+        >>>
+        >>> @udtf(returnType="a: int")
+        ... class TestUDTF:
+        ...     def eval(self, row: Row):
+        ...         if row[0] > 5:
+        ...             yield row[0],
+        >>> df = spark.range(8)
+        >>> TestUDTF(df.argument()).show()  # doctest: +SKIP
+        +---+
+        |  a|
+        +---+
+        |  6|
+        |  7|
+        +---+
+        """
+        ...
+
     def scalar(self) -> Column:
         """
         Return a `Column` object for a SCALAR Subquery containing exactly one row and one column.
