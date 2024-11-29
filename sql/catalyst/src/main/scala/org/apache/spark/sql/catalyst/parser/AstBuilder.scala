@@ -2250,14 +2250,6 @@ class AstBuilder extends DataTypeAstBuilder
     FunctionIdentifier(ctx.function.getText, Option(ctx.db).map(_.getText))
   }
 
-  /**
-   * Create a multi-part identifier.
-   */
-  override def visitMultipartIdentifier(ctx: MultipartIdentifierContext): Seq[String] =
-    withOrigin(ctx) {
-      ctx.parts.asScala.map(_.getText).toSeq
-    }
-
   /* ********************************************************************************************
    * Expression parsing
    * ******************************************************************************************** */
@@ -2670,15 +2662,16 @@ class AstBuilder extends DataTypeAstBuilder
    */
   override def visitCollate(ctx: CollateContext): Expression = withOrigin(ctx) {
     val collationName = visitCollateClause(ctx.collateClause())
-    Collate(expression(ctx.primaryExpression), collationName)
+
+    Collate(expression(ctx.primaryExpression), UnresolvedCollation(collationName))
   }
 
-  override def visitCollateClause(ctx: CollateClauseContext): String = withOrigin(ctx) {
-    val collationName = ctx.collationName.getText
-    if (!SQLConf.get.trimCollationEnabled && collationName.toUpperCase().contains("TRIM")) {
+  override def visitCollateClause(ctx: CollateClauseContext): Seq[String] = withOrigin(ctx) {
+    val collationName = visitMultipartIdentifier(ctx.collationName)
+    if (!SQLConf.get.trimCollationEnabled && collationName.last.toUpperCase().contains("TRIM")) {
       throw QueryCompilationErrors.trimCollationNotEnabledError()
     }
-    ctx.identifier.getText
+    collationName
   }
 
   /**
