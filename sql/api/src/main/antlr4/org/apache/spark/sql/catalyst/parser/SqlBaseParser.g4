@@ -40,6 +40,11 @@ options { tokenVocab = SqlBaseLexer; }
    * When true, double quoted literals are identifiers rather than STRINGs.
    */
   public boolean double_quoted_identifiers = false;
+
+  /**
+   * When true, SELECT lists (and other named expression lists) support an optional trailing comma.
+   */
+  public boolean optional_trailing_comma_in_named_expression_lists = true;
 }
 
 compoundOrSingleStatement
@@ -1030,7 +1035,10 @@ namedExpression
     ;
 
 namedExpressionSeq
-    : namedExpression (COMMA namedExpression)*
+    : {optional_trailing_comma_in_named_expression_lists}?
+        namedExpression (COMMA namedExpression)* COMMA?
+    | {!optional_trailing_comma_in_named_expression_lists}?
+        namedExpression (COMMA namedExpression)*
     ;
 
 partitionFieldList
